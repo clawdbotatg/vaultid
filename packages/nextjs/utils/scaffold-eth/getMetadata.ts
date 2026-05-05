@@ -1,14 +1,19 @@
 import type { Metadata } from "next";
 
-const baseUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL
-  ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
-  : `http://localhost:${process.env.PORT || 3000}`;
-const titleTemplate = "%s | Scaffold-ETH 2";
+// Prefer NEXT_PUBLIC_PRODUCTION_URL (the absolute origin where the static export
+// is served) so OG and Twitter previews resolve absolute URLs even on IPFS.
+const baseUrl = process.env.NEXT_PUBLIC_PRODUCTION_URL
+  ? process.env.NEXT_PUBLIC_PRODUCTION_URL
+  : process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : `http://localhost:${process.env.PORT || 3000}`;
+
+const titleTemplate = "%s | VaultID";
 
 export const getMetadata = ({
   title,
   description,
-  imageRelativePath = "/thumbnail.jpg",
+  imageRelativePath = "/thumbnail.svg",
 }: {
   title: string;
   description: string;
@@ -46,9 +51,8 @@ export const getMetadata = ({
     icons: {
       icon: [
         {
-          url: "/favicon.png",
-          sizes: "32x32",
-          type: "image/png",
+          url: "/favicon.svg",
+          type: "image/svg+xml",
         },
       ],
     },

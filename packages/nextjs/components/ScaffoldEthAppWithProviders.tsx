@@ -9,6 +9,7 @@ import { Toaster } from "react-hot-toast";
 import { WagmiProvider } from "wagmi";
 import { Footer } from "~~/components/Footer";
 import { Header } from "~~/components/Header";
+import { VaultKeyProvider } from "~~/components/VaultKeyProvider";
 import { BlockieAvatar } from "~~/components/scaffold-eth";
 import { wagmiConfig } from "~~/services/web3/wagmiConfig";
 
@@ -49,8 +50,10 @@ export const ScaffoldEthAppWithProviders = ({ children }: { children: React.Reac
           avatar={BlockieAvatar}
           theme={mounted ? (isDarkMode ? darkTheme() : lightTheme()) : lightTheme()}
         >
-          <ProgressBar height="3px" color="#2299dd" />
-          <ScaffoldEthApp>{children}</ScaffoldEthApp>
+          <ProgressBar height="3px" color="#C9A84C" />
+          <VaultKeyProvider>
+            <ScaffoldEthApp>{children}</ScaffoldEthApp>
+          </VaultKeyProvider>
         </RainbowKitProvider>
       </QueryClientProvider>
     </WagmiProvider>

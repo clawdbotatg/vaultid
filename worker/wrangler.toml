@@ -1,0 +1,17 @@
+name = "vaultid-upload"
+main = "src/index.ts"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+# These are sensible defaults; the deployer overrides as needed.
+[vars]
+FRONTEND_ORIGIN = "*"
+VAULTID_ADDRESS = "0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558"
+CLAWD_ADDRESS = "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07"
+# 0 means "look up clawdMintFee at request time"; set to a fixed wei value to
+# avoid per-request RPC reads.
+MIN_ALLOWANCE_WEI = "0"
+ALCHEMY_BASE_PATH = "base-mainnet"
+
+# Set with `wrangler secret put PINATA_JWT` and `wrangler secret put ALCHEMY_API_KEY`.
+# Do NOT commit secrets here.

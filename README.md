@@ -1,83 +1,95 @@
-# 🏗 Scaffold-ETH 2
+# VaultID
 
-<h4 align="center">
-  <a href="https://docs.scaffoldeth.io">Documentation</a> |
-  <a href="https://scaffoldeth.io">Website</a>
-</h4>
+**Proof, passes, and memories — privately yours.**
 
-🧪 An open-source, up-to-date toolkit for building decentralized applications (dapps) on the Ethereum blockchain. It's designed to make it easier for developers to create and deploy smart contracts and build user interfaces that interact with those contracts.
+VaultID is a soulbound, end-to-end encrypted vault on Base. Mint a token that
+holds files + a private note. Only the holder (and an optional backup wallet)
+can decrypt; anyone can publicly verify category, expiry, and integrity.
 
-> [!NOTE]
-> 🤖 Scaffold-ETH 2 is AI-ready! It has everything agents need to build on Ethereum. Check `.agents/`, `.claude/`, `.opencode` or `.cursor/` for more info.
+- **Soulbound** ERC-721 — non-transferable on-chain
+- **AES-256-GCM** content + **ECIES (secp256k1 + HKDF + AES-GCM)** wrapped keys
+- **CLAWD** mint fee — payable from the holder's wallet
+- **Cloudflare Worker** uploads ciphertext to **Pinata**; the JWT never reaches the browser
+- **IPFS-deployable** static export — the dApp itself runs without a backend
 
-⚙️ Built using NextJS, RainbowKit, Foundry, Wagmi, Viem, and Typescript.
+## Stack
 
-- ✅ **Contract Hot Reload**: Your frontend auto-adapts to your smart contract as you edit it.
-- 🪝 **[Custom hooks](https://docs.scaffoldeth.io/hooks/)**: Collection of React hooks wrapper around [wagmi](https://wagmi.sh/) to simplify interactions with smart contracts with typescript autocompletion.
-- 🧱 [**Components**](https://docs.scaffoldeth.io/components/): Collection of common web3 components to quickly build your frontend.
-- 🔥 **Burner Wallet & Local Faucet**: Quickly test your application with a burner wallet and local faucet.
-- 🔐 **Integration with Wallet Providers**: Connect to different wallet providers and interact with the Ethereum network.
+- Smart contract: `packages/foundry/contracts/VaultID.sol`
+- Frontend: `packages/nextjs/` (Next.js App Router, RainbowKit, Wagmi, Viem, TailwindCSS + DaisyUI)
+- Upload proxy: `worker/` (Cloudflare Worker — TypeScript, deployed via `wrangler`)
+- Deployment target: Base mainnet (chain id `8453`)
 
-![Debug Contracts tab](https://github.com/scaffold-eth/scaffold-eth-2/assets/55535804/b237af0c-5027-4849-a5c1-2e31495cccb1)
+## Live deployment
 
-## Requirements
-
-Before you begin, you need to install the following tools:
-
-- [Node (>= v20.18.3)](https://nodejs.org/en/download/)
-- Yarn ([v1](https://classic.yarnpkg.com/en/docs/install/) or [v2+](https://yarnpkg.com/getting-started/install))
-- [Git](https://git-scm.com/downloads)
+| | Address |
+|---|---|
+| VaultID | [`0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558`](https://basescan.org/address/0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558) (verified) |
+| CLAWD (Base) | [`0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07`](https://basescan.org/address/0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07) |
+| Owner | `0xFE968dE21eb0E77d5877477C31a04A3075c0086E` |
 
 ## Quickstart
 
-To get started with Scaffold-ETH 2, follow the steps below:
-
-1. Install dependencies if it was skipped in CLI:
-
-```
-cd my-dapp-example
+```bash
 yarn install
+# Configure your env (see packages/nextjs/.env.example)
+cp packages/nextjs/.env.example packages/nextjs/.env.local
+
+# Static export (production build for IPFS)
+cd packages/nextjs
+NEXT_PUBLIC_IPFS_BUILD=true NODE_OPTIONS="--require ./polyfill-localstorage.cjs" yarn build
+
+# Output: packages/nextjs/out/
 ```
 
-2. Run a local network in the first terminal:
+## How encryption works (one paragraph)
 
-```
-yarn chain
-```
+Each user wallet derives a deterministic vault keypair on first sign-in: the
+wallet signs a fixed message (`PRIMARY_KEY_AUTH_MESSAGE`); we hash that
+signature into a secp256k1 scalar that becomes the vault private key. The
+public key is used as the recipient for ECIES. Per-vault, we generate a fresh
+AES-256-GCM key, encrypt the bundle, then ECIES-wrap the AES key once per
+recipient (holder + optional backup). The wrapped envelope is JSON-encoded and
+uploaded to IPFS via the Worker. `keccak256(plaintext bundle)` is published
+on-chain as `contentHash` so anyone can later prove integrity if the holder
+chooses to reveal.
 
-This command starts a local Ethereum network using Foundry. The network runs on your local machine and can be used for testing and development. You can customize the network configuration in `packages/foundry/foundry.toml`.
+## Crypto details
 
-3. On a second terminal, deploy the test contract:
+| | |
+|---|---|
+| Wrap | secp256k1 ECDH → HKDF-SHA256("VaultID/ECIES/v1", 32) → AES-256-GCM |
+| Bundle | AES-256-GCM (96-bit nonce, fresh per vault) |
+| Hash | keccak256 of the JSON-encoded plaintext bundle bytes |
+| Key derivation | sha256(walletSig) reduced into secp256k1 [1, n) |
 
-```
-yarn deploy
-```
+The wallet's real signing key is never exposed; everything happens client-side
+in the browser.
 
-This command deploys a test smart contract to the local network. The contract is located in `packages/foundry/contracts` and can be modified to suit your needs. The `yarn deploy` command uses the deploy script located in `packages/foundry/script` to deploy the contract to the network. You can also customize the deploy script.
+## Configure the Worker
 
-4. On a third terminal, start your NextJS app:
+Without a Cloudflare Worker, the dApp falls back to direct Pinata uploads
+using `NEXT_PUBLIC_PINATA_JWT` — useful for local testing only, since that
+JWT would be embedded in the static bundle.
 
-```
-yarn start
-```
+For production, see `worker/README.md`. You'll set:
 
-Visit your app on: `http://localhost:3000`. You can interact with your smart contract using the `Debug Contracts` page. You can tweak the app config in `packages/nextjs/scaffold.config.ts`.
+- `PINATA_JWT` (Worker secret)
+- `ALCHEMY_API_KEY` (Worker secret) — used for Base RPC
+- `FRONTEND_ORIGIN` (Worker var) — CORS origin (e.g. your IPFS gateway URL)
+- `VAULTID_ADDRESS`, `CLAWD_ADDRESS`, `MIN_ALLOWANCE_WEI` (Worker vars)
 
-Run smart contract test with `yarn foundry:test`
+Then in the frontend env: `NEXT_PUBLIC_WORKER_URL=https://<your-worker>`.
 
-- Edit your smart contracts in `packages/foundry/contracts`
-- Edit your frontend homepage at `packages/nextjs/app/page.tsx`. For guidance on [routing](https://nextjs.org/docs/app/building-your-application/routing/defining-routes) and configuring [pages/layouts](https://nextjs.org/docs/app/building-your-application/routing/pages-and-layouts) checkout the Next.js documentation.
-- Edit your deployment scripts in `packages/foundry/script`
+## Routes
 
+| Path | Description |
+|---|---|
+| `/` | Landing page |
+| `/create` | Encrypt + mint (requires connect + sign) |
+| `/vault` | List of vaults you hold |
+| `/vault/view?id=N` | Open vault N (decrypt locally) |
+| `/verify?id=N` | Public verification (no wallet required) |
 
-## Documentation
+## Known gaps
 
-Visit our [docs](https://docs.scaffoldeth.io) to learn how to start building with Scaffold-ETH 2.
-
-To know more about its features, check out our [website](https://scaffoldeth.io).
-
-## Contributing to Scaffold-ETH 2
-
-We welcome contributions to Scaffold-ETH 2!
-
-Please see [CONTRIBUTING.MD](https://github.com/scaffold-eth/scaffold-eth-2/blob/main/CONTRIBUTING.md) for more information and guidelines for contributing to Scaffold-ETH 2.
+See `NEXT_STEPS.md`.
