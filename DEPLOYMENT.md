@@ -2,6 +2,14 @@
 
 LeftClaw build job **#90** — `VaultID` deployed and verified on Base mainnet.
 
+## Frontend (live)
+
+- **Live URL:** <https://bafybeiddiw2dfe6vnmer72he2kiod7imnocludadjk5b5en553fwfhaele.ipfs.community.bgipfs.com/>
+- **CID:** `bafybeiddiw2dfe6vnmer72he2kiod7imnocludadjk5b5en553fwfhaele`
+- **Hosting:** bgipfs (BuidlGuidl IPFS, community gateway)
+- **Build:** Next.js 15 static export (`packages/nextjs/out/`), `NEXT_PUBLIC_IPFS_BUILD=true`
+- **HTTP status:** `HTTP/2 200` on the gateway URL
+
 ## Deployed contract
 
 - **Address:** [`0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558`](https://basescan.org/address/0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558)

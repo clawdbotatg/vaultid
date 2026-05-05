@@ -1,5 +1,11 @@
 # NEXT_STEPS — VaultID
 
+## Live preview
+
+- **Frontend (IPFS):** <https://bafybeiddiw2dfe6vnmer72he2kiod7imnocludadjk5b5en553fwfhaele.ipfs.community.bgipfs.com/>
+- **CID:** `bafybeiddiw2dfe6vnmer72he2kiod7imnocludadjk5b5en553fwfhaele`
+- **VaultID contract on Base:** [`0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558`](https://basescan.org/address/0x6252F44e1C92F3dD614B11Cc6e8699a8cCf26558#code)
+
 This file lists everything the worker did NOT ship in Stage 6 and what the
 client needs to do to make VaultID fully production-ready.
 
