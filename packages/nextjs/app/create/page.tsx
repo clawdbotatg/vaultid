@@ -31,6 +31,7 @@ import {
 } from "~~/lib/vault";
 import { notification } from "~~/utils/scaffold-eth";
 import { getParsedErrorWithAllAbis } from "~~/utils/scaffold-eth/contract";
+import { writeAndOpen } from "~~/utils/scaffold-eth/writeAndOpen";
 
 const ERC20_ABI = erc20Contracts[8453].CLAWD.abi;
 
@@ -225,11 +226,20 @@ const CreateForm = () => {
     try {
       // 1. Build the plaintext bundle.
       const encFiles = await Promise.all(files.map(fileToEncryptedFile));
+      // The contract enforces expiry from `defaultValidityPeriod`; the date
+      // the user picks here is a personal reminder we encrypt alongside the
+      // bundle so the holder can see "you intended this vault to expire on X"
+      // when they decrypt later.
+      const expirySeconds = expiry ? Math.floor(new Date(expiry + "T23:59:59Z").getTime() / 1000) : 0;
       const bundle: PlaintextBundle = {
         v: 1,
         files: encFiles,
         note: note.trim() || undefined,
-        meta: { createdAt: Math.floor(Date.now() / 1000), category },
+        meta: {
+          createdAt: Math.floor(Date.now() / 1000),
+          category,
+          expiresAt: expirySeconds || undefined,
+        },
       };
       // 2. Recipients: always self; backup if resolved.
       const recipients: Recipient[] = [{ address: address as `0x${string}`, publicKey: myPubKey }];
@@ -249,13 +259,15 @@ const CreateForm = () => {
       // 5. Approve CLAWD if needed (exact fee, never unlimited).
       if (allowance < fee) {
         setStep("approving");
-        const approveTx = await writeContractAsync({
-          address: CLAWD_ADDRESS,
-          abi: ERC20_ABI,
-          functionName: "approve",
-          args: [VAULTID_ADDRESS, fee],
-          chainId: base.id,
-        });
+        const approveTx = await writeAndOpen(() =>
+          writeContractAsync({
+            address: CLAWD_ADDRESS,
+            abi: ERC20_ABI,
+            functionName: "approve",
+            args: [VAULTID_ADDRESS, fee],
+            chainId: base.id,
+          }),
+        );
         setStep("approving-wait");
         await publicClient.waitForTransactionReceipt({ hash: approveTx, confirmations: 1 });
         // Hold disabled until we re-read allowance (1 short cooldown):
@@ -265,21 +277,21 @@ const CreateForm = () => {
 
       // 6. Mint.
       setStep("minting");
-      const expirySeconds = expiry ? Math.floor(new Date(expiry + "T23:59:59Z").getTime() / 1000) : 0;
-      void expirySeconds; // contract uses defaultValidityPeriod from mintedAt; expiry input is informational only
-      const mintTx = await writeContractAsync({
-        address: VAULTID_ADDRESS,
-        abi: VAULTID_ABI,
-        functionName: "mintWithCLAWD",
-        args: [
-          address,
-          indexFromCategory(category),
-          (backupRecipient?.address ?? ZERO_ADDRESS) as `0x${string}`,
-          uploaded.uri,
-          envelope.contentHash,
-        ],
-        chainId: base.id,
-      });
+      const mintTx = await writeAndOpen(() =>
+        writeContractAsync({
+          address: VAULTID_ADDRESS,
+          abi: VAULTID_ABI,
+          functionName: "mintWithCLAWD",
+          args: [
+            address,
+            indexFromCategory(category),
+            (backupRecipient?.address ?? ZERO_ADDRESS) as `0x${string}`,
+            uploaded.uri,
+            envelope.contentHash,
+          ],
+          chainId: base.id,
+        }),
+      );
       setStep("minting-wait");
       const receipt = await publicClient.waitForTransactionReceipt({ hash: mintTx, confirmations: 1 });
 
@@ -426,7 +438,7 @@ const CreateForm = () => {
           />
           <p className="text-xs opacity-60 mt-1">
             On-chain expiry is set automatically from the contract&rsquo;s default validity period. The date you pick is
-            recorded in the encrypted note for your reference.
+            encrypted in the bundle metadata as a personal reminder &mdash; visible to you when you view the vault.
           </p>
         </div>
       </section>

@@ -14,6 +14,7 @@ import { fetchEncryptedEnvelope } from "~~/lib/ipfs";
 import { OnChainVault, VAULTID_ABI, VAULTID_ADDRESS, categoryFromIndex, vaultStatus } from "~~/lib/vault";
 import { notification } from "~~/utils/scaffold-eth";
 import { getParsedErrorWithAllAbis } from "~~/utils/scaffold-eth/contract";
+import { writeAndOpen } from "~~/utils/scaffold-eth/writeAndOpen";
 
 const Page: NextPage = () => (
   <main className="max-w-5xl mx-auto px-4 py-10">
@@ -114,13 +115,15 @@ const ViewBody = ({ tokenId }: { tokenId: bigint }) => {
     if (!publicClient) return;
     setBurnPending(true);
     try {
-      const hash = await writeContractAsync({
-        address: VAULTID_ADDRESS,
-        abi: VAULTID_ABI,
-        functionName: "burn",
-        args: [tokenId],
-        chainId: base.id,
-      });
+      const hash = await writeAndOpen(() =>
+        writeContractAsync({
+          address: VAULTID_ADDRESS,
+          abi: VAULTID_ABI,
+          functionName: "burn",
+          args: [tokenId],
+          chainId: base.id,
+        }),
+      );
       await publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
       notification.success("Vault burned.");
       await refetchVault();
@@ -284,6 +287,13 @@ const BundleView = ({
 
   return (
     <div className="space-y-5">
+      {bundle.meta.expiresAt && (
+        <div className="vault-card-muted p-3 text-xs opacity-80 border-l-4 border-warning/40">
+          You marked this vault for personal expiry on{" "}
+          <strong>{new Date(bundle.meta.expiresAt * 1000).toLocaleDateString()}</strong> (encrypted reminder only — not
+          enforced on-chain).
+        </div>
+      )}
       {bundle.note && (
         <div className="vault-card-muted p-4 border-l-4 border-primary/60">
           <h4 className="text-sm font-semibold opacity-70 m-0 mb-2">Note</h4>

@@ -89,6 +89,11 @@ export type PlaintextBundle = {
     createdAt: number;
     /** Human-readable category name, mirrors the on-chain enum. */
     category: string;
+    /**
+     * Optional unix timestamp (seconds) the user picked as a personal expiry
+     * reminder. Stored encrypted with the bundle; not enforced on-chain.
+     */
+    expiresAt?: number;
   };
 };
 
