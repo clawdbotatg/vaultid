@@ -5,6 +5,7 @@ import { ERC721 } from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 import { Base64 } from "@openzeppelin/contracts/utils/Base64.sol";
@@ -15,7 +16,11 @@ import { Base64 } from "@openzeppelin/contracts/utils/Base64.sol";
  *
  * Each VaultID NFT is a non-transferable on-chain identity bound to a single
  * owner wallet. It carries a category, an immutable backup wallet, an optional
- * expiry, and is rendered fully on-chain as an SVG badge.
+ * expiry, and is rendered fully on-chain as an SVG badge. Each vault also
+ * carries an `encryptedContentURI` (IPFS CID of an encrypted bundle) and a
+ * `contentHash` (keccak256 of the original plaintext bundle) — both are
+ * storage-only metadata, retrievable via `getVault(tokenId)`, and never
+ * exposed in the public-facing on-chain `tokenURI` JSON/SVG output.
  *
  * Vaults can be minted in two ways:
  *  - `mintWithCLAWD` — by paying `clawdMintFee` of the CLAWD token (always available).
@@ -28,8 +33,14 @@ import { Base64 } from "@openzeppelin/contracts/utils/Base64.sol";
  * Vaults are non-transferable and may be soft-burned by their owner (the badge
  * is marked inactive, but the token itself stays in place so the burn is
  * permanently observable on-chain).
+ *
+ * @dev `balanceOf` reflects the total number of vaults ever minted to a holder
+ *      including those that have been soft-burned (i.e. `active == false`).
+ *      Off-chain integrators that need a "live count" should iterate over
+ *      tokens and consult `getVault` / `isActive` rather than relying on
+ *      `balanceOf`.
  */
-contract VaultID is ERC721, Ownable, ReentrancyGuard {
+contract VaultID is ERC721, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Strings for uint256;
     using Strings for address;
@@ -44,6 +55,12 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     /// @notice Number of supported categories (0..NUM_CATEGORIES-1).
     uint8 public constant NUM_CATEGORIES = 6;
 
+    /// @notice Hard cap on either mint fee (CLAWD or CV). Generous, prevents bricking.
+    uint256 public constant MAX_MINT_FEE = 1_000_000_000 * 10 ** 18; // 1B units (in fee-token wei)
+
+    /// @notice Hard cap on `defaultValidityPeriod` (100 years in seconds).
+    uint64 public constant MAX_VALIDITY_PERIOD = 100 * 365 days;
+
     // ---------------------------------------------------------------------
     // Types
     // ---------------------------------------------------------------------
@@ -55,6 +72,8 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
         uint64 mintedAt; // unix seconds
         uint64 expiresAt; // 0 = never expires
         bool active; // false after soft burn
+        string encryptedContentURI; // IPFS CID of the encrypted bundle
+        bytes32 contentHash; // keccak256 of the original plaintext bundle
     }
 
     // ---------------------------------------------------------------------
@@ -64,8 +83,10 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     /// @notice CLAWD ERC-20 used to pay the CLAWD mint fee. Immutable.
     IERC20 public immutable clawdToken;
 
-    /// @notice CV ERC-20 used to pay the CV mint fee. May be unset (zero).
-    /// @dev Mutable — owner may call `setCvToken` to wire in a real ERC-20 later.
+    /// @notice CV ERC-20 used to pay the CV mint fee. May be unset (zero) initially.
+    /// @dev Mutable but ONE-SHOT — owner may call `setCvToken` to wire in a real
+    ///      ERC-20 exactly once, while it's still the zero address. Once set,
+    ///      `setCvToken` reverts with `CvTokenAlreadySet`.
     IERC20 public cvToken;
 
     /// @notice CLAWD-denominated mint fee (in CLAWD wei). Configurable by owner.
@@ -99,7 +120,9 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
         address indexed backupWallet,
         uint8 category,
         uint64 expiresAt,
-        bool paidWithCv
+        bool paidWithCv,
+        bytes32 contentHash,
+        string encryptedContentURI
     );
     event VaultBurned(uint256 indexed tokenId, address indexed holder);
     event VaultExpiryExtended(uint256 indexed tokenId, uint64 newExpiresAt);
@@ -112,6 +135,8 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
 
     // ERC-5192
     event Locked(uint256 tokenId);
+    /// @dev Declared for ABI completeness; never emitted (vaults never unlock).
+    event Unlocked(uint256 tokenId);
 
     // ---------------------------------------------------------------------
     // Errors
@@ -125,8 +150,15 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     error TokenExpired(uint256 tokenId);
     error Soulbound();
     error CvTokenNotSet();
+    error CvTokenAlreadySet();
     error InvalidExpiryExtension();
     error LabelTooLong();
+    error EmptyContentURI();
+    error ZeroContentHash();
+    error FeeTooLarge();
+    error ValidityPeriodTooLarge();
+    error BackupWalletEqualsHolder();
+    error RenouncementDisabled();
 
     // ---------------------------------------------------------------------
     // Constructor
@@ -168,17 +200,26 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     // Admin
     // ---------------------------------------------------------------------
 
+    /**
+     * @notice One-shot setter for the CV ERC-20. May only be called while
+     *         `cvToken == address(0)`. Once set, the CV token is permanently
+     *         locked — there is no path to disable or change it.
+     * @dev Reverts with `CvTokenAlreadySet` if already configured.
+     */
     function setCvToken(address newCvToken) external onlyOwner {
+        if (address(cvToken) != address(0)) revert CvTokenAlreadySet();
         cvToken = IERC20(newCvToken);
         emit CvTokenUpdated(newCvToken);
     }
 
     function setClawdMintFee(uint256 newFee) external onlyOwner {
+        if (newFee > MAX_MINT_FEE) revert FeeTooLarge();
         clawdMintFee = newFee;
         emit ClawdMintFeeUpdated(newFee);
     }
 
     function setCvMintFee(uint256 newFee) external onlyOwner {
+        if (newFee > MAX_MINT_FEE) revert FeeTooLarge();
         cvMintFee = newFee;
         emit CvMintFeeUpdated(newFee);
     }
@@ -190,6 +231,7 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     }
 
     function setDefaultValidityPeriod(uint64 newPeriod) external onlyOwner {
+        if (newPeriod > MAX_VALIDITY_PERIOD) revert ValidityPeriodTooLarge();
         defaultValidityPeriod = newPeriod;
         emit DefaultValidityPeriodUpdated(newPeriod);
     }
@@ -201,54 +243,76 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
         emit CategoryLabelSet(category, label);
     }
 
+    /**
+     * @notice Renouncing ownership is permanently disabled — the contract has
+     *         too many admin functions (fee recipient, expiry extension, etc.)
+     *         to safely orphan. Use `transferOwnership` to a new owner instead.
+     */
+    function renounceOwnership() public view override onlyOwner {
+        revert RenouncementDisabled();
+    }
+
     // ---------------------------------------------------------------------
     // Minting
     // ---------------------------------------------------------------------
 
     /**
      * @notice Mint a VaultID by paying `clawdMintFee` in CLAWD.
-     * @param to            Recipient (vault holder). Must be non-zero.
-     * @param category      Category id (0..NUM_CATEGORIES-1).
-     * @param backupWallet  Immutable backup wallet for this vault. Must be non-zero
-     *                      and not equal to `to`.
+     * @dev Only standard ERC-20 tokens are supported. Fee-on-transfer or
+     *      rebasing tokens will not work correctly — the contract assumes
+     *      `safeTransferFrom(amount)` moves exactly `amount` units.
+     * @param to                  Recipient (vault holder). Must be non-zero.
+     * @param category            Category id (0..NUM_CATEGORIES-1).
+     * @param backupWallet        Immutable backup wallet for this vault. Must be
+     *                            non-zero and not equal to `to`.
+     * @param encryptedContentURI IPFS CID of the encrypted bundle. Must be non-empty.
+     * @param contentHash         keccak256 of the original plaintext bundle. Must be non-zero.
      */
-    function mintWithCLAWD(address to, uint8 category, address backupWallet)
-        external
-        nonReentrant
-        returns (uint256 tokenId)
-    {
-        tokenId = _mintVault(to, category, backupWallet, false);
-        if (clawdMintFee > 0) {
-            clawdToken.safeTransferFrom(msg.sender, feeRecipient, clawdMintFee);
-        }
+    function mintWithCLAWD(
+        address to,
+        uint8 category,
+        address backupWallet,
+        string calldata encryptedContentURI,
+        bytes32 contentHash
+    ) external nonReentrant returns (uint256 tokenId) {
+        tokenId = _mintVault(to, category, backupWallet, encryptedContentURI, contentHash, false);
     }
 
     /**
      * @notice Mint a VaultID by paying `cvMintFee` in CV.
      * @dev Reverts with `CvTokenNotSet` if the owner has not yet wired in a CV ERC-20.
+     *      Only standard ERC-20 tokens are supported. Fee-on-transfer or rebasing
+     *      tokens will not work correctly.
      */
-    function mintWithCV(address to, uint8 category, address backupWallet)
-        external
-        nonReentrant
-        returns (uint256 tokenId)
-    {
+    function mintWithCV(
+        address to,
+        uint8 category,
+        address backupWallet,
+        string calldata encryptedContentURI,
+        bytes32 contentHash
+    ) external nonReentrant returns (uint256 tokenId) {
         // Per spec: this must be the very first check.
         if (address(cvToken) == address(0)) revert CvTokenNotSet();
-        tokenId = _mintVault(to, category, backupWallet, true);
-        if (cvMintFee > 0) {
-            cvToken.safeTransferFrom(msg.sender, feeRecipient, cvMintFee);
-        }
+        tokenId = _mintVault(to, category, backupWallet, encryptedContentURI, contentHash, true);
     }
 
-    function _mintVault(address to, uint8 category, address backupWallet, bool paidWithCv)
-        internal
-        returns (uint256 tokenId)
-    {
+    function _mintVault(
+        address to,
+        uint8 category,
+        address backupWallet,
+        string calldata encryptedContentURI,
+        bytes32 contentHash,
+        bool paidWithCv
+    ) internal returns (uint256 tokenId) {
+        // ---- Validate inputs ----
         if (to == address(0)) revert ZeroAddress();
         if (backupWallet == address(0)) revert ZeroAddress();
-        if (backupWallet == to) revert ZeroAddress();
+        if (backupWallet == to) revert BackupWalletEqualsHolder();
         if (category >= NUM_CATEGORIES) revert InvalidCategory(category);
+        if (bytes(encryptedContentURI).length == 0) revert EmptyContentURI();
+        if (contentHash == bytes32(0)) revert ZeroContentHash();
 
+        // ---- Write Vault struct ----
         tokenId = _nextTokenId++;
         uint64 expiresAt = defaultValidityPeriod == 0 ? 0 : uint64(block.timestamp) + defaultValidityPeriod;
 
@@ -258,12 +322,26 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
             category: category,
             mintedAt: uint64(block.timestamp),
             expiresAt: expiresAt,
-            active: true
+            active: true,
+            encryptedContentURI: encryptedContentURI,
+            contentHash: contentHash
         });
 
+        // ---- Pull fee BEFORE _safeMint (defense-in-depth ordering) ----
+        if (paidWithCv) {
+            if (cvMintFee > 0) {
+                cvToken.safeTransferFrom(msg.sender, feeRecipient, cvMintFee);
+            }
+        } else {
+            if (clawdMintFee > 0) {
+                clawdToken.safeTransferFrom(msg.sender, feeRecipient, clawdMintFee);
+            }
+        }
+
+        // ---- Mint and emit ----
         _safeMint(to, tokenId);
         emit Locked(tokenId);
-        emit VaultMinted(tokenId, to, backupWallet, category, expiresAt, paidWithCv);
+        emit VaultMinted(tokenId, to, backupWallet, category, expiresAt, paidWithCv, contentHash, encryptedContentURI);
     }
 
     // ---------------------------------------------------------------------
@@ -285,12 +363,17 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
 
     /**
      * @notice Owner can extend a vault's expiry (e.g. after off-chain renewal).
-     * @dev Setting `newExpiresAt` to 0 makes the vault never expire.
-     *      Otherwise, the new expiry must be strictly greater than the old one.
+     * @dev Setting `newExpiresAt` to 0 is NOT allowed once a finite expiry was
+     *      set. A vault minted with `defaultValidityPeriod == 0` (never expires)
+     *      cannot be downgraded to a finite expiry. Burned vaults cannot be
+     *      extended.
      */
     function extendExpiry(uint256 tokenId, uint64 newExpiresAt) external onlyOwner {
         Vault storage v = _vaults[tokenId];
         if (v.holder == address(0)) revert TokenNotFound(tokenId);
+        if (!v.active) revert TokenAlreadyBurned(tokenId);
+        // Never-expire vaults must stay never-expire — owner cannot downgrade.
+        if (v.expiresAt == 0 && newExpiresAt != 0) revert InvalidExpiryExtension();
         if (newExpiresAt != 0 && newExpiresAt <= v.expiresAt) revert InvalidExpiryExtension();
         v.expiresAt = newExpiresAt;
         emit VaultExpiryExtended(tokenId, newExpiresAt);
@@ -380,6 +463,15 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
     // Metadata (fully on-chain SVG)
     // ---------------------------------------------------------------------
 
+    /**
+     * @notice On-chain JSON+SVG metadata for `tokenId`.
+     * @dev Returns metadata even for soft-burned vaults (the SVG shows a
+     *      BURNED overlay). This is intentional so the burn is visible
+     *      forever via marketplaces / explorers. Integrators that need the
+     *      live status should consult `isActive`.
+     *      `encryptedContentURI` and `contentHash` are NEVER embedded here —
+     *      they are storage-only metadata, accessible via `getVault`.
+     */
     function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
         Vault memory v = _vaults[tokenId];
         if (v.holder == address(0)) revert TokenNotFound(tokenId);
@@ -412,7 +504,7 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
         string memory part1 = string(
             abi.encodePacked(
                 '[{"trait_type":"Category","value":"',
-                _safeCategoryLabel(v.category),
+                _jsonEscape(_safeCategoryLabel(v.category)),
                 '"},{"trait_type":"Holder","value":"',
                 v.holder.toHexString(),
                 '"},{"trait_type":"Backup Wallet","value":"',
@@ -452,6 +544,33 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
         string memory label = categoryLabel[category];
         if (bytes(label).length == 0) return string(abi.encodePacked("Category ", uint256(category).toString()));
         return label;
+    }
+
+    /**
+     * @dev Minimal JSON string escape: handles the two structural characters
+     *      (`"` and `\`) that would otherwise break JSON parsing. Other ASCII
+     *      control characters (\x00..\x1F) are not expected in category labels
+     *      (which are bounded to 32 bytes and set by the contract owner), but
+     *      callers writing labels should keep this constraint in mind.
+     */
+    function _jsonEscape(string memory s) internal pure returns (string memory) {
+        bytes memory b = bytes(s);
+        // Worst-case: every byte needs escaping (doubles length).
+        bytes memory out = new bytes(b.length * 2);
+        uint256 j = 0;
+        for (uint256 i = 0; i < b.length; i++) {
+            bytes1 c = b[i];
+            if (c == 0x22 /* " */ || c == 0x5c /* \ */ ) {
+                out[j++] = 0x5c; // backslash
+                out[j++] = c;
+            } else {
+                out[j++] = c;
+            }
+        }
+        // Trim to actual length.
+        bytes memory trimmed = new bytes(j);
+        for (uint256 k = 0; k < j; k++) trimmed[k] = out[k];
+        return string(trimmed);
     }
 
     // ---------------------------------------------------------------------
@@ -606,7 +725,7 @@ contract VaultID is ERC721, Ownable, ReentrancyGuard {
 
     function _shortAddr(address a) internal pure returns (string memory) {
         bytes memory full = bytes(a.toHexString());
-        // 0x + 4 + ... + 4 = 14 chars
+        // 0x + 4 + 3 dots + 4 = 13 chars total in the output buffer.
         bytes memory out = new bytes(13);
         out[0] = "0";
         out[1] = "x";

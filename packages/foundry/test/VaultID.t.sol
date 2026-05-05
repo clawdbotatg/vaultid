@@ -6,6 +6,7 @@ import { console } from "forge-std/console.sol";
 import { VaultID } from "../contracts/VaultID.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @dev Minimal mintable ERC20 used as both CLAWD and CV in tests.
 contract MockERC20 is ERC20 {
@@ -38,6 +39,10 @@ contract VaultIDTest is Test {
     address internal bobBackup = address(0xBB0);
 
     bytes4 internal constant ERC5192_ID = 0xb45a3c0e;
+
+    // Sample mint metadata used by the helpers.
+    string internal constant SAMPLE_URI = "ipfs://bafyExampleEncryptedBundleCID";
+    bytes32 internal constant SAMPLE_HASH = keccak256("sample-bundle-plaintext");
 
     function setUp() public {
         clawd = new MockERC20("CLAWD", "CLAWD");
@@ -94,7 +99,7 @@ contract VaultIDTest is Test {
 
         uint256 feeBefore = clawd.balanceOf(owner);
         vm.prank(alice);
-        uint256 id = vault.mintWithCLAWD(alice, 0, aliceBackup);
+        uint256 id = vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
 
         assertEq(id, 1);
         assertEq(vault.ownerOf(1), alice);
@@ -107,6 +112,8 @@ contract VaultIDTest is Test {
         assertEq(v.category, 0);
         assertTrue(v.active);
         assertEq(v.expiresAt, 0);
+        assertEq(v.encryptedContentURI, SAMPLE_URI);
+        assertEq(v.contentHash, SAMPLE_HASH);
     }
 
     function test_mintWithCLAWD_revertsOnZeroTo() public {
@@ -114,7 +121,7 @@ contract VaultIDTest is Test {
         clawd.approve(address(vault), type(uint256).max);
         vm.prank(alice);
         vm.expectRevert(VaultID.ZeroAddress.selector);
-        vault.mintWithCLAWD(address(0), 0, aliceBackup);
+        vault.mintWithCLAWD(address(0), 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
     }
 
     function test_mintWithCLAWD_revertsOnZeroBackup() public {
@@ -122,15 +129,15 @@ contract VaultIDTest is Test {
         clawd.approve(address(vault), type(uint256).max);
         vm.prank(alice);
         vm.expectRevert(VaultID.ZeroAddress.selector);
-        vault.mintWithCLAWD(alice, 0, address(0));
+        vault.mintWithCLAWD(alice, 0, address(0), SAMPLE_URI, SAMPLE_HASH);
     }
 
     function test_mintWithCLAWD_revertsWhenBackupEqualsHolder() public {
         vm.prank(alice);
         clawd.approve(address(vault), type(uint256).max);
         vm.prank(alice);
-        vm.expectRevert(VaultID.ZeroAddress.selector);
-        vault.mintWithCLAWD(alice, 0, alice);
+        vm.expectRevert(VaultID.BackupWalletEqualsHolder.selector);
+        vault.mintWithCLAWD(alice, 0, alice, SAMPLE_URI, SAMPLE_HASH);
     }
 
     function test_mintWithCLAWD_revertsOnInvalidCategory() public {
@@ -138,14 +145,30 @@ contract VaultIDTest is Test {
         clawd.approve(address(vault), type(uint256).max);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(VaultID.InvalidCategory.selector, uint8(6)));
-        vault.mintWithCLAWD(alice, 6, aliceBackup);
+        vault.mintWithCLAWD(alice, 6, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
+    }
+
+    function test_mintWithCLAWD_revertsOnEmptyURI() public {
+        vm.prank(alice);
+        clawd.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vm.expectRevert(VaultID.EmptyContentURI.selector);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, "", SAMPLE_HASH);
+    }
+
+    function test_mintWithCLAWD_revertsOnZeroContentHash() public {
+        vm.prank(alice);
+        clawd.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vm.expectRevert(VaultID.ZeroContentHash.selector);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, bytes32(0));
     }
 
     function test_mintWithCLAWD_revertsWhenNoApproval() public {
         vm.prank(alice);
         // No approval -> SafeERC20 should bubble a revert.
         vm.expectRevert();
-        vault.mintWithCLAWD(alice, 0, aliceBackup);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
     }
 
     function test_mintWithCLAWD_zeroFee_skipsTransfer() public {
@@ -153,7 +176,7 @@ contract VaultIDTest is Test {
         vault.setClawdMintFee(0);
         vm.prank(alice);
         // No approval needed when fee is 0
-        uint256 id = vault.mintWithCLAWD(alice, 1, aliceBackup);
+        uint256 id = vault.mintWithCLAWD(alice, 1, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
         assertEq(id, 1);
         assertEq(vault.ownerOf(1), alice);
     }
@@ -165,10 +188,27 @@ contract VaultIDTest is Test {
         vm.expectEmit(true, false, false, false, address(vault));
         emit VaultID.Locked(1);
         vm.expectEmit(true, true, true, true, address(vault));
-        emit VaultID.VaultMinted(1, alice, aliceBackup, 0, 0, false);
+        emit VaultID.VaultMinted(1, alice, aliceBackup, 0, 0, false, SAMPLE_HASH, SAMPLE_URI);
 
         vm.prank(alice);
-        vault.mintWithCLAWD(alice, 0, aliceBackup);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
+    }
+
+    /// @dev Defense-in-depth ordering: fee transfer happens BEFORE _safeMint.
+    ///      Verify the happy-path balance change is correct end-to-end.
+    function test_mintWithCLAWD_feePulledBeforeMint() public {
+        vm.prank(alice);
+        clawd.approve(address(vault), type(uint256).max);
+
+        uint256 aliceBefore = clawd.balanceOf(alice);
+        uint256 ownerBefore = clawd.balanceOf(owner);
+
+        vm.prank(alice);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
+
+        assertEq(clawd.balanceOf(alice), aliceBefore - 100e18);
+        assertEq(clawd.balanceOf(owner), ownerBefore + 100e18);
+        assertEq(vault.ownerOf(1), alice);
     }
 
     // ---------- mintWithCV behavior (CV unset / set) ----------
@@ -179,14 +219,14 @@ contract VaultIDTest is Test {
         cv.approve(address(vault), type(uint256).max);
         vm.prank(alice);
         vm.expectRevert(VaultID.CvTokenNotSet.selector);
-        vault.mintWithCV(alice, 0, aliceBackup);
+        vault.mintWithCV(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
     }
 
     function test_mintWithCV_revertsWithCvNotSetBeforeOtherChecks() public {
         // Even with bogus inputs (zero `to`, equal backup), CvTokenNotSet must fire first.
         vm.prank(alice);
         vm.expectRevert(VaultID.CvTokenNotSet.selector);
-        vault.mintWithCV(address(0), 6, address(0));
+        vault.mintWithCV(address(0), 6, address(0), "", bytes32(0));
     }
 
     function test_setCvToken_isOnlyOwner() public {
@@ -203,19 +243,24 @@ contract VaultIDTest is Test {
         assertEq(address(vault.cvToken()), address(cv));
     }
 
-    function test_setCvToken_canDisableAgain() public {
+    /// @dev One-shot setter: after `cvToken` is set, subsequent calls revert.
+    function test_setCvToken_isOneShot_revertsOnSecondCall() public {
         vm.prank(owner);
         vault.setCvToken(address(cv));
-        vm.prank(owner);
-        vault.setCvToken(address(0));
-        assertEq(address(vault.cvToken()), address(0));
 
-        // mintWithCV should revert again now.
-        vm.prank(alice);
-        cv.approve(address(vault), type(uint256).max);
-        vm.prank(alice);
-        vm.expectRevert(VaultID.CvTokenNotSet.selector);
-        vault.mintWithCV(alice, 0, aliceBackup);
+        // Calling with a different ERC-20 must revert with CvTokenAlreadySet.
+        MockERC20 otherToken = new MockERC20("OTHER", "OTHER");
+        vm.prank(owner);
+        vm.expectRevert(VaultID.CvTokenAlreadySet.selector);
+        vault.setCvToken(address(otherToken));
+
+        // Calling again with address(0) (attempt to "disable") must also revert.
+        vm.prank(owner);
+        vm.expectRevert(VaultID.CvTokenAlreadySet.selector);
+        vault.setCvToken(address(0));
+
+        // cvToken is unchanged from the first set.
+        assertEq(address(vault.cvToken()), address(cv));
     }
 
     function test_mintWithCV_worksAfterSetCvToken() public {
@@ -227,7 +272,7 @@ contract VaultIDTest is Test {
 
         uint256 ownerCvBefore = cv.balanceOf(owner);
         vm.prank(alice);
-        uint256 id = vault.mintWithCV(alice, 2, aliceBackup);
+        uint256 id = vault.mintWithCV(alice, 2, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
         assertEq(id, 1);
         assertEq(vault.ownerOf(1), alice);
         assertEq(cv.balanceOf(owner), ownerCvBefore + 100e18);
@@ -235,6 +280,28 @@ contract VaultIDTest is Test {
         VaultID.Vault memory v = vault.getVault(1);
         assertEq(v.category, 2);
         assertTrue(v.active);
+        assertEq(v.encryptedContentURI, SAMPLE_URI);
+        assertEq(v.contentHash, SAMPLE_HASH);
+    }
+
+    function test_mintWithCV_revertsOnEmptyURI() public {
+        vm.prank(owner);
+        vault.setCvToken(address(cv));
+        vm.prank(alice);
+        cv.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vm.expectRevert(VaultID.EmptyContentURI.selector);
+        vault.mintWithCV(alice, 0, aliceBackup, "", SAMPLE_HASH);
+    }
+
+    function test_mintWithCV_revertsOnZeroContentHash() public {
+        vm.prank(owner);
+        vault.setCvToken(address(cv));
+        vm.prank(alice);
+        cv.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vm.expectRevert(VaultID.ZeroContentHash.selector);
+        vault.mintWithCV(alice, 0, aliceBackup, SAMPLE_URI, bytes32(0));
     }
 
     // ---------- Soulbound enforcement ----------
@@ -360,17 +427,35 @@ contract VaultIDTest is Test {
         assertEq(vault.getVault(1).expiresAt, newExp);
     }
 
-    function test_extendExpiry_canSetToNever() public {
+    function test_extendExpiry_canSetToNever_fromFinite() public {
         vm.prank(owner);
         vault.setDefaultValidityPeriod(7 days);
         _mintAlice(0);
 
+        // Vault starts with a finite expiry — owner can extend to "never".
         vm.prank(owner);
         vault.extendExpiry(1, 0);
         assertEq(vault.getVault(1).expiresAt, 0);
         // Warp far ahead — should still be active.
         vm.warp(block.timestamp + 365 days);
         assertTrue(vault.isActive(1));
+    }
+
+    /// @dev M-02 fix: a never-expire vault cannot be downgraded to a finite expiry.
+    function test_extendExpiry_neverExpire_cannotBeDowngradedToFinite() public {
+        // defaultValidityPeriod is 0 by default — vault is minted as "never expires".
+        _mintAlice(0);
+        VaultID.Vault memory v = vault.getVault(1);
+        assertEq(v.expiresAt, 0);
+
+        vm.prank(owner);
+        vm.expectRevert(VaultID.InvalidExpiryExtension.selector);
+        vault.extendExpiry(1, uint64(block.timestamp) + 30 days);
+
+        // Setting "never" → "never" is a no-op but allowed (no downgrade).
+        vm.prank(owner);
+        vault.extendExpiry(1, 0);
+        assertEq(vault.getVault(1).expiresAt, 0);
     }
 
     function test_extendExpiry_revertsOnNonIncrease() public {
@@ -395,6 +480,19 @@ contract VaultIDTest is Test {
         vault.extendExpiry(1, uint64(block.timestamp) + 1 days);
     }
 
+    /// @dev L-02 fix: extending a burned vault must revert.
+    function test_extendExpiry_burned_reverts() public {
+        vm.prank(owner);
+        vault.setDefaultValidityPeriod(7 days);
+        _mintAlice(0);
+        vm.prank(alice);
+        vault.burn(1);
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(VaultID.TokenAlreadyBurned.selector, uint256(1)));
+        vault.extendExpiry(1, uint64(block.timestamp) + 30 days);
+    }
+
     // ---------- Admin setters ----------
 
     function test_setClawdMintFee_onlyOwner() public {
@@ -417,6 +515,46 @@ contract VaultIDTest is Test {
         assertEq(vault.cvMintFee(), 7e18);
     }
 
+    /// @dev L-03: fee setters must reject values above MAX_MINT_FEE; boundary OK.
+    function test_setClawdMintFee_capBoundary() public {
+        uint256 cap = vault.MAX_MINT_FEE();
+
+        // Boundary: exactly at cap is allowed.
+        vm.prank(owner);
+        vault.setClawdMintFee(cap);
+        assertEq(vault.clawdMintFee(), cap);
+
+        // One above cap reverts.
+        vm.prank(owner);
+        vm.expectRevert(VaultID.FeeTooLarge.selector);
+        vault.setClawdMintFee(cap + 1);
+    }
+
+    function test_setCvMintFee_capBoundary() public {
+        uint256 cap = vault.MAX_MINT_FEE();
+
+        vm.prank(owner);
+        vault.setCvMintFee(cap);
+        assertEq(vault.cvMintFee(), cap);
+
+        vm.prank(owner);
+        vm.expectRevert(VaultID.FeeTooLarge.selector);
+        vault.setCvMintFee(cap + 1);
+    }
+
+    /// @dev I-07: validity period setter must reject values above MAX_VALIDITY_PERIOD.
+    function test_setDefaultValidityPeriod_capBoundary() public {
+        uint64 cap = vault.MAX_VALIDITY_PERIOD();
+
+        vm.prank(owner);
+        vault.setDefaultValidityPeriod(cap);
+        assertEq(vault.defaultValidityPeriod(), cap);
+
+        vm.prank(owner);
+        vm.expectRevert(VaultID.ValidityPeriodTooLarge.selector);
+        vault.setDefaultValidityPeriod(cap + 1);
+    }
+
     function test_setFeeRecipient_onlyOwnerAndNonZero() public {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
@@ -433,7 +571,7 @@ contract VaultIDTest is Test {
         clawd.approve(address(vault), type(uint256).max);
         uint256 carolBefore = clawd.balanceOf(carol);
         vm.prank(alice);
-        vault.mintWithCLAWD(alice, 0, aliceBackup);
+        vault.mintWithCLAWD(alice, 0, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
         assertEq(clawd.balanceOf(carol), carolBefore + 100e18);
     }
 
@@ -453,6 +591,40 @@ contract VaultIDTest is Test {
         vm.prank(owner);
         vault.setCategoryLabel(0, "Custom");
         assertEq(vault.categoryLabel(0), "Custom");
+    }
+
+    // ---------- Ownable2Step + renounce ----------
+
+    /// @dev L-01: ownership transfer follows the 2-step Ownable2Step flow.
+    function test_transferOwnership_isTwoStep() public {
+        // Step 1: owner queues the transfer; ownership not yet handed over.
+        vm.prank(owner);
+        vault.transferOwnership(bob);
+        assertEq(vault.owner(), owner);
+        assertEq(vault.pendingOwner(), bob);
+
+        // Pending owner cannot perform owner-only actions yet.
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bob));
+        vault.setClawdMintFee(1);
+
+        // Step 2: pending owner accepts.
+        vm.prank(bob);
+        vault.acceptOwnership();
+        assertEq(vault.owner(), bob);
+        assertEq(vault.pendingOwner(), address(0));
+
+        // Old owner is no longer authorized.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        vault.setClawdMintFee(1);
+    }
+
+    /// @dev I-08: renounceOwnership is permanently disabled.
+    function test_renounceOwnership_disabled() public {
+        vm.prank(owner);
+        vm.expectRevert(VaultID.RenouncementDisabled.selector);
+        vault.renounceOwnership();
     }
 
     // ---------- Token URI / metadata ----------
@@ -480,10 +652,48 @@ contract VaultIDTest is Test {
             vm.prank(holder);
             clawd.approve(address(vault), type(uint256).max);
             vm.prank(holder);
-            vault.mintWithCLAWD(holder, c, backup);
+            vault.mintWithCLAWD(holder, c, backup, SAMPLE_URI, SAMPLE_HASH);
             string memory uri = vault.tokenURI(c + 1);
             assertGt(bytes(uri).length, 200);
         }
+    }
+
+    /// @dev I-01: a category label containing JSON-meaningful chars must be escaped.
+    function test_tokenURI_jsonEscapesLabel() public {
+        // Set label with a literal `"` and a `\` — these must be escaped in the JSON.
+        vm.prank(owner);
+        vault.setCategoryLabel(0, "a\"b\\c");
+
+        _mintAlice(0);
+
+        string memory uri = vault.tokenURI(1);
+
+        // The data URI prefix is "data:application/json;base64,".
+        bytes memory uriBytes = bytes(uri);
+        // Strip the prefix and base64-decode the remainder.
+        string memory b64 = _substr(uri, 29, uriBytes.length - 29);
+        bytes memory json = _b64decode(b64);
+
+        // The decoded JSON must contain the escaped form (`a\"b\\c` ⇒ literal: `a\"b\\c`)
+        // i.e. the bytes `a`, `\`, `"`, `b`, `\`, `\`, `c`.
+        bytes memory expectedFragment = abi.encodePacked('"value":"', bytes1("a"), bytes1(0x5c), bytes1(0x22), bytes1("b"), bytes1(0x5c), bytes1(0x5c), bytes1("c"), bytes1(0x22));
+        assertTrue(_contains(json, expectedFragment), "escaped label not found in JSON");
+    }
+
+    /// @dev tokenURI must NOT include encryptedContentURI nor contentHash.
+    function test_tokenURI_doesNotLeakStorageOnlyMetadata() public {
+        _mintAlice(0);
+        string memory uri = vault.tokenURI(1);
+        bytes memory uriBytes = bytes(uri);
+        string memory b64 = _substr(uri, 29, uriBytes.length - 29);
+        bytes memory json = _b64decode(b64);
+
+        // Sample URI must NOT appear anywhere.
+        assertFalse(_contains(json, bytes(SAMPLE_URI)), "encryptedContentURI leaked into tokenURI");
+        // Hex form of the contentHash must NOT appear either.
+        // (Cheap proxy: check for the first 6 hex chars of SAMPLE_HASH.)
+        bytes memory hexPrefix = _hex6(SAMPLE_HASH);
+        assertFalse(_contains(json, hexPrefix), "contentHash leaked into tokenURI");
     }
 
     // ---------- View helpers ----------
@@ -502,13 +712,28 @@ contract VaultIDTest is Test {
         vault.getVault(123);
     }
 
+    /// @dev getVault returns the URI + hash exactly as supplied at mint.
+    function test_getVault_returnsContentMetadata() public {
+        string memory uri = "ipfs://bafyMyVeryOwnCID";
+        bytes32 hash = keccak256("plaintext-bundle-v1");
+
+        vm.prank(alice);
+        clawd.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vault.mintWithCLAWD(alice, 3, aliceBackup, uri, hash);
+
+        VaultID.Vault memory v = vault.getVault(1);
+        assertEq(v.encryptedContentURI, uri);
+        assertEq(v.contentHash, hash);
+    }
+
     // ---------- Internal helpers ----------
 
     function _mintAlice(uint8 cat) internal {
         vm.prank(alice);
         clawd.approve(address(vault), type(uint256).max);
         vm.prank(alice);
-        vault.mintWithCLAWD(alice, cat, aliceBackup);
+        vault.mintWithCLAWD(alice, cat, aliceBackup, SAMPLE_URI, SAMPLE_HASH);
     }
 
     function _substr(string memory s, uint256 start, uint256 len) internal pure returns (string memory) {
@@ -518,5 +743,69 @@ contract VaultIDTest is Test {
             out[i] = b[start + i];
         }
         return string(out);
+    }
+
+    function _contains(bytes memory haystack, bytes memory needle) internal pure returns (bool) {
+        if (needle.length == 0) return true;
+        if (needle.length > haystack.length) return false;
+        for (uint256 i = 0; i <= haystack.length - needle.length; i++) {
+            bool match_ = true;
+            for (uint256 j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    match_ = false;
+                    break;
+                }
+            }
+            if (match_) return true;
+        }
+        return false;
+    }
+
+    /// @dev First 6 lowercase hex chars (no 0x prefix) of a bytes32.
+    function _hex6(bytes32 x) internal pure returns (bytes memory) {
+        bytes memory hexChars = "0123456789abcdef";
+        bytes memory out = new bytes(6);
+        for (uint256 i = 0; i < 3; i++) {
+            uint8 b = uint8(x[i]);
+            out[i * 2] = hexChars[b >> 4];
+            out[i * 2 + 1] = hexChars[b & 0x0f];
+        }
+        return out;
+    }
+
+    /// @dev Minimal base64 decoder for tests. No padding-strict checks — Base64.encode
+    ///      from OZ always pads correctly.
+    function _b64decode(string memory s) internal pure returns (bytes memory) {
+        bytes memory data = bytes(s);
+        // Build reverse table inline (only 64 chars + padding).
+        // Map: A-Z=0-25, a-z=26-51, 0-9=52-61, +=62, /=63, '='=0 (padding).
+        require(data.length % 4 == 0, "bad b64 length");
+        uint256 padding = 0;
+        if (data.length > 0 && data[data.length - 1] == 0x3d) padding++;
+        if (data.length > 1 && data[data.length - 2] == 0x3d) padding++;
+        bytes memory out = new bytes((data.length / 4) * 3 - padding);
+        uint256 j = 0;
+        for (uint256 i = 0; i < data.length; i += 4) {
+            uint256 a = _b64char(data[i]);
+            uint256 b = _b64char(data[i + 1]);
+            uint256 c = _b64char(data[i + 2]);
+            uint256 d = _b64char(data[i + 3]);
+            uint256 chunk = (a << 18) | (b << 12) | (c << 6) | d;
+            if (j < out.length) out[j++] = bytes1(uint8(chunk >> 16));
+            if (j < out.length) out[j++] = bytes1(uint8((chunk >> 8) & 0xff));
+            if (j < out.length) out[j++] = bytes1(uint8(chunk & 0xff));
+        }
+        return out;
+    }
+
+    function _b64char(bytes1 c) internal pure returns (uint256) {
+        uint8 v = uint8(c);
+        if (v >= 0x41 && v <= 0x5a) return v - 0x41; // A-Z
+        if (v >= 0x61 && v <= 0x7a) return v - 0x61 + 26; // a-z
+        if (v >= 0x30 && v <= 0x39) return v - 0x30 + 52; // 0-9
+        if (v == 0x2b) return 62; // +
+        if (v == 0x2f) return 63; // /
+        if (v == 0x3d) return 0; // = (padding)
+        revert("bad b64 char");
     }
 }
